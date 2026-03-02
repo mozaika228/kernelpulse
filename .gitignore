@@ -1,0 +1,16 @@
+.DS_Store
+*.o
+*.tmp
+*.out
+dist/
+bin/
+
+# Go
+vendor/
+*.test
+coverage.out
+
+# Generated eBPF artifacts
+internal/ebpf/kernelpulse_bpf*.go
+internal/ebpf/kernelpulse_bpf*.o
+bpf/vmlinux.h
