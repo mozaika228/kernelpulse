@@ -28,15 +28,22 @@ jobs:
           BPFT=""
           for pkg in "linux-tools-$(uname -r)" "linux-cloud-tools-$(uname -r)" "linux-tools-azure" "linux-cloud-tools-azure" "linux-tools-common"; do
             if dpkg -s "$pkg" >/dev/null 2>&1; then
-              CAND=$(dpkg -L "$pkg" 2>/dev/null | grep -E '/bpftool$' | head -n1 || true)
-              if [ -n "$CAND" ] && [ -x "$CAND" ]; then
+              while IFS= read -r CAND; do
+                if [ -x "$CAND" ] && file "$CAND" | grep -q "ELF"; then
+                  BPFT="$CAND"
+                  break
+                fi
+              done < <(dpkg -L "$pkg" 2>/dev/null | grep -E '/bpftool$' || true)
+            fi
+            [ -n "$BPFT" ] && break
+          done
+          if [ -z "$BPFT" ]; then
+            while IFS= read -r CAND; do
+              if [ -x "$CAND" ] && file "$CAND" | grep -q "ELF"; then
                 BPFT="$CAND"
                 break
               fi
-            fi
-          done
-          if [ -z "$BPFT" ]; then
-            BPFT=$(find /usr -type f -name bpftool 2>/dev/null | grep -E 'linux|tools' | head -n1 || true)
+            done < <(find /usr/lib/linux-tools -type f -name bpftool 2>/dev/null || true)
           fi
           if [ -z "$BPFT" ]; then
             echo "bpftool binary not found after installing linux-tools/linux-cloud-tools packages"
@@ -44,8 +51,10 @@ jobs:
             dpkg -l | grep -E 'linux-tools|linux-cloud-tools' || true
             exit 1
           fi
+          echo "$(dirname "$BPFT")" >> "$GITHUB_PATH"
+          echo "BPFT_PATH=$BPFT" >> "$GITHUB_ENV"
           sudo ln -sf "$BPFT" /usr/local/bin/bpftool
-          /usr/local/bin/bpftool version
+          "$BPFT" version
 
       - name: Download modules
         run: go mod download
