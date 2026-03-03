@@ -24,7 +24,9 @@ jobs:
           sudo apt-get install -y clang llvm libelf-dev make
 
       - name: Download modules
-        run: go mod download
+        run: |
+          go mod download
+          go mod download github.com/cilium/ebpf
 
       - name: Generate BPF objects
         run: make generate
