@@ -15,6 +15,11 @@ if ! command -v bpftool >/dev/null 2>&1; then
   exit 0
 fi
 
+if ! bpftool version >/dev/null 2>&1; then
+  echo "[kernelpulse] skipping bpftool selftest: bpftool wrapper is present but not usable on this runner"
+  exit 0
+fi
+
 cleanup() {
   sudo rm -rf "$PIN_BASE" >/dev/null 2>&1 || true
 }
