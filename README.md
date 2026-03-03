@@ -138,7 +138,9 @@ GitHub Actions workflow:
 
 ## CO-RE notes
 
-- Uses kernel BTF to generate `bpf/vmlinux.h`
+- Repository ships with `bpf/vmlinux.h` for reproducible CI builds
+- You can refresh it locally from target kernel BTF when needed:
+  - `bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h`
 - CO-RE-compatible field access in kernel-dependent paths
 - Build once, run on multiple compatible kernels
 

@@ -10,6 +10,11 @@ if [[ ! -f "$OBJ" ]]; then
   exit 1
 fi
 
+if ! command -v bpftool >/dev/null 2>&1; then
+  echo "[kernelpulse] skipping bpftool selftest: bpftool is not available on this runner"
+  exit 0
+fi
+
 cleanup() {
   sudo rm -rf "$PIN_BASE" >/dev/null 2>&1 || true
 }

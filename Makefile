@@ -7,7 +7,6 @@ deps:
 	go mod tidy
 
 generate:
-	bpftool btf dump file /sys/kernel/btf/vmlinux format c > $(VMLINUX)
 	go generate ./internal/ebpf
 
 build:

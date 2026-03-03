@@ -21,40 +21,7 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libelf-dev make linux-tools-common linux-cloud-tools-common
-          sudo apt-get install -y "linux-tools-$(uname -r)" "linux-cloud-tools-$(uname -r)" || \
-            sudo apt-get install -y linux-tools-azure linux-cloud-tools-azure || true
-
-          BPFT=""
-          for pkg in "linux-tools-$(uname -r)" "linux-cloud-tools-$(uname -r)" "linux-tools-azure" "linux-cloud-tools-azure" "linux-tools-common"; do
-            if dpkg -s "$pkg" >/dev/null 2>&1; then
-              while IFS= read -r CAND; do
-                if [ -x "$CAND" ] && file "$CAND" | grep -q "ELF"; then
-                  BPFT="$CAND"
-                  break
-                fi
-              done < <(dpkg -L "$pkg" 2>/dev/null | grep -E '/bpftool$' || true)
-            fi
-            [ -n "$BPFT" ] && break
-          done
-          if [ -z "$BPFT" ]; then
-            while IFS= read -r CAND; do
-              if [ -x "$CAND" ] && file "$CAND" | grep -q "ELF"; then
-                BPFT="$CAND"
-                break
-              fi
-            done < <(find /usr/lib/linux-tools -type f -name bpftool 2>/dev/null || true)
-          fi
-          if [ -z "$BPFT" ]; then
-            echo "bpftool binary not found after installing linux-tools/linux-cloud-tools packages"
-            echo "Installed packages:"
-            dpkg -l | grep -E 'linux-tools|linux-cloud-tools' || true
-            exit 1
-          fi
-          echo "$(dirname "$BPFT")" >> "$GITHUB_PATH"
-          echo "BPFT_PATH=$BPFT" >> "$GITHUB_ENV"
-          sudo ln -sf "$BPFT" /usr/local/bin/bpftool
-          "$BPFT" version
+          sudo apt-get install -y clang llvm libelf-dev make
 
       - name: Download modules
         run: go mod download
