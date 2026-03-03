@@ -21,7 +21,7 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libelf-dev make
+          sudo apt-get install -y clang llvm libelf-dev libbpf-dev make
 
       - name: Download modules
         run: |

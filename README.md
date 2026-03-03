@@ -52,7 +52,7 @@ Production-oriented eBPF kernel observability toolkit for Linux.
 Requirements:
 
 - Linux with BTF enabled (`/sys/kernel/btf/vmlinux`)
-- `clang`, `bpftool`, `make`
+- `clang`, `libbpf-dev`, `make`
 - Go 1.22+
 - root privileges / required capabilities
 
