@@ -5,9 +5,39 @@ typedef unsigned char __u8;
 typedef unsigned short __u16;
 typedef unsigned int __u32;
 typedef unsigned long long __u64;
+typedef signed long long __s64;
 typedef signed int __s32;
+typedef __u16 __be16;
+typedef __u32 __be32;
+typedef __u32 __wsum;
 
-struct pt_regs {};
+struct pt_regs {
+    __u64 r15;
+    __u64 r14;
+    __u64 r13;
+    __u64 r12;
+    __u64 bp;
+    __u64 bx;
+    __u64 r11;
+    __u64 r10;
+    __u64 r9;
+    __u64 r8;
+    __u64 ax;
+    __u64 cx;
+    __u64 dx;
+    __u64 si;
+    __u64 di;
+    __u64 orig_ax;
+    __u64 ip;
+    __u64 cs;
+    __u64 flags;
+    __u64 sp;
+    __u64 ss;
+    __u64 rdi;
+    __u64 rsi;
+    __u64 rdx;
+    __u64 rcx;
+};
 
 struct sock {};
 
