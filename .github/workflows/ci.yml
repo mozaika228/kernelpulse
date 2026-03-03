@@ -23,15 +23,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang llvm libelf-dev make linux-tools-common
           sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-azure || true
-          if ! command -v bpftool >/dev/null 2>&1; then
-            BPFT=$(find /usr/lib/linux-tools -type f -name bpftool | sort | tail -n1)
-            if [ -z "$BPFT" ]; then
-              echo "bpftool binary not found after installing linux-tools packages"
-              exit 1
-            fi
-            sudo ln -sf "$BPFT" /usr/local/bin/bpftool
+          BPFT=$(find /usr/lib/linux-tools -type f -name bpftool | sort | tail -n1 || true)
+          if [ -z "$BPFT" ]; then
+            echo "bpftool binary not found under /usr/lib/linux-tools"
+            echo "Installed packages:"
+            dpkg -l | grep linux-tools || true
+            exit 1
           fi
-          bpftool version
+          sudo ln -sf "$BPFT" /usr/local/bin/bpftool
+          /usr/local/bin/bpftool version
 
       - name: Download modules
         run: go mod download
