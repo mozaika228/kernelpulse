@@ -9,6 +9,8 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
+    env:
+      GOFLAGS: -mod=mod
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,6 +29,7 @@ jobs:
         run: |
           go mod download
           go mod download github.com/cilium/ebpf
+          go mod tidy
 
       - name: Generate BPF objects
         run: make generate
