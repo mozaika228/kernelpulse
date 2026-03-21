@@ -605,8 +605,10 @@ func tupleFromRetransmit(e TCPRetransmitEvent) TCPTuple {
 		Daddr4: e.Daddr,
 	}
 	if e.Family == 10 {
-		copy(t.Saddr6[:], v6ToBytes(e.SaddrV6))
-		copy(t.Daddr6[:], v6ToBytes(e.DaddrV6))
+		s := v6ToBytes(e.SaddrV6)
+		d := v6ToBytes(e.DaddrV6)
+		copy(t.Saddr6[:], s[:])
+		copy(t.Daddr6[:], d[:])
 	}
 	return t
 }
@@ -620,8 +622,10 @@ func tupleFromRTT(e TCPRTTEvent) TCPTuple {
 		Daddr4: e.Daddr,
 	}
 	if e.Family == 10 {
-		copy(t.Saddr6[:], v6ToBytes(e.SaddrV6))
-		copy(t.Daddr6[:], v6ToBytes(e.DaddrV6))
+		s := v6ToBytes(e.SaddrV6)
+		d := v6ToBytes(e.DaddrV6)
+		copy(t.Saddr6[:], s[:])
+		copy(t.Daddr6[:], d[:])
 	}
 	return t
 }
