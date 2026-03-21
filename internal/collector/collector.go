@@ -45,10 +45,18 @@ type TCPRetransmitEvent struct {
 	LPort  uint16
 	DPort  uint16
 	_      uint16
+	Saddr  uint32
+	Daddr  uint32
 }
 
 type TCPRTTEvent struct {
 	Header
+	Family uint16
+	Sport  uint16
+	Dport  uint16
+	_      uint16
+	Saddr  uint32
+	Daddr  uint32
 	SRTTus uint32
 	_      [4]byte
 }
@@ -68,6 +76,7 @@ type SchedLatencyEvent struct {
 
 type ExecEvent struct {
 	Header
+	Filename [64]byte
 }
 
 type SyscallTop struct {
@@ -81,6 +90,14 @@ type ProcTop struct {
 	PID          uint32  `json:"pid"`
 	Comm         string  `json:"comm"`
 	Count        uint64  `json:"count"`
+	MaxLatencyMS float64 `json:"max_latency_ms"`
+	AvgLatencyMS float64 `json:"avg_latency_ms"`
+}
+
+type CommTop struct {
+	Comm         string  `json:"comm"`
+	Count        uint64  `json:"count"`
+	P99          float64 `json:"p99"`
 	MaxLatencyMS float64 `json:"max_latency_ms"`
 	AvgLatencyMS float64 `json:"avg_latency_ms"`
 }
@@ -113,6 +130,8 @@ type Snapshot struct {
 	SyscallHeatmap map[string]uint64 `json:"syscall_heatmap"`
 	TopSyscalls    []SyscallTop      `json:"top_syscalls"`
 	TopProcesses   []ProcTop         `json:"top_processes"`
+	TopComms       []CommTop         `json:"top_comms"`
+	TopExecs       []ExecTop         `json:"top_execs"`
 }
 
 type syscallAgg struct {
@@ -126,6 +145,22 @@ type procAgg struct {
 	count uint64
 	total uint64
 	max   uint64
+}
+
+type commAgg struct {
+	count uint64
+	total uint64
+	max   uint64
+	hist  *hdrhistogram.Histogram
+}
+
+type execAgg struct {
+	count uint64
+}
+
+type ExecTop struct {
+	Filename string `json:"filename"`
+	Count    uint64 `json:"count"`
 }
 
 type Aggregator struct {
@@ -143,6 +178,8 @@ type Aggregator struct {
 	syscallHeatmap map[string]uint64
 	syscallAgg     map[uint32]*syscallAgg
 	procAgg        map[uint32]*procAgg
+	commAgg        map[string]*commAgg
+	execAgg        map[string]*execAgg
 
 	syscallHist *hdrhistogram.Histogram
 	tcpRTTHist  *hdrhistogram.Histogram
@@ -155,6 +192,8 @@ func NewAggregator() *Aggregator {
 		syscallHeatmap: map[string]uint64{},
 		syscallAgg:     map[uint32]*syscallAgg{},
 		procAgg:        map[uint32]*procAgg{},
+		commAgg:        map[string]*commAgg{},
+		execAgg:        map[string]*execAgg{},
 		syscallHist:    hdrhistogram.New(1, 60_000_000, 3), // us
 		tcpRTTHist:     hdrhistogram.New(1, 30_000_000, 3), // us
 		runQHist:       hdrhistogram.New(1, 30_000_000, 3), // us
@@ -222,6 +261,8 @@ func (a *Aggregator) SnapshotAndReset(topN int) Snapshot {
 		SyscallHeatmap: cloneMap(a.syscallHeatmap),
 		TopSyscalls:    a.topSyscalls(topN),
 		TopProcesses:   a.topProcesses(topN),
+		TopComms:       a.topComms(topN),
+		TopExecs:       a.topExecs(topN),
 	}
 
 	a.windowStart = end
@@ -234,6 +275,8 @@ func (a *Aggregator) SnapshotAndReset(topN int) Snapshot {
 	clear(a.syscallHeatmap)
 	clear(a.syscallAgg)
 	clear(a.procAgg)
+	clear(a.commAgg)
+	clear(a.execAgg)
 	a.syscallHist.Reset()
 	a.tcpRTTHist.Reset()
 	a.runQHist.Reset()
@@ -273,6 +316,25 @@ func (a *Aggregator) observeSyscall(raw []byte) error {
 	pagg.total += e.LatencyNs
 	if e.LatencyNs > pagg.max {
 		pagg.max = e.LatencyNs
+	}
+
+	comm := commString(e.Comm)
+	if comm != "" {
+		cagg := a.commAgg[comm]
+		if cagg == nil {
+			if len(a.commAgg) < 256 {
+				cagg = &commAgg{hist: hdrhistogram.New(1, 60_000_000, 3)}
+				a.commAgg[comm] = cagg
+			}
+		}
+		if cagg != nil {
+			cagg.count++
+			cagg.total += e.LatencyNs
+			if e.LatencyNs > cagg.max {
+				cagg.max = e.LatencyNs
+			}
+			_ = cagg.hist.RecordValue(int64(us))
+		}
 	}
 	return nil
 }
@@ -329,6 +391,15 @@ func (a *Aggregator) observeExec(raw []byte) error {
 	}
 	a.mu.Lock()
 	a.execEvents++
+	name := strings.TrimRight(string(e.Filename[:]), "\x00")
+	if name != "" {
+		agg := a.execAgg[name]
+		if agg == nil {
+			agg = &execAgg{}
+			a.execAgg[name] = agg
+		}
+		agg.count++
+	}
 	a.mu.Unlock()
 	return nil
 }
@@ -368,6 +439,43 @@ func (a *Aggregator) topProcesses(topN int) []ProcTop {
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].MaxLatencyMS > out[j].MaxLatencyMS })
+	if topN > 0 && len(out) > topN {
+		return out[:topN]
+	}
+	return out
+}
+
+func (a *Aggregator) topComms(topN int) []CommTop {
+	out := make([]CommTop, 0, len(a.commAgg))
+	for comm, agg := range a.commAgg {
+		if agg.count == 0 {
+			continue
+		}
+		p99 := 0.0
+		if agg.hist != nil && agg.hist.TotalCount() > 0 {
+			p99 = float64(agg.hist.ValueAtQuantile(99.0)) / 1000
+		}
+		out = append(out, CommTop{
+			Comm:         comm,
+			Count:        agg.count,
+			P99:          p99,
+			MaxLatencyMS: float64(agg.max) / 1_000_000,
+			AvgLatencyMS: float64(agg.total) / float64(agg.count) / 1_000_000,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].P99 > out[j].P99 })
+	if topN > 0 && len(out) > topN {
+		return out[:topN]
+	}
+	return out
+}
+
+func (a *Aggregator) topExecs(topN int) []ExecTop {
+	out := make([]ExecTop, 0, len(a.execAgg))
+	for name, agg := range a.execAgg {
+		out = append(out, ExecTop{Filename: name, Count: agg.count})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Count > out[j].Count })
 	if topN > 0 && len(out) > topN {
 		return out[:topN]
 	}

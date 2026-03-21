@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -29,9 +30,15 @@ import (
 
 type filterConfig struct {
 	PID     uint32
+	UID     uint32
+	Saddr   uint32
+	Daddr   uint32
+	Sport   uint16
+	Dport   uint16
+	Family  uint16
 	Comm    [16]byte
 	CommSet uint8
-	_       [3]byte
+	_       [1]byte
 }
 
 var (
@@ -53,7 +60,12 @@ func main() {
 	var (
 		interval   = flag.Duration("interval", 5*time.Second, "report interval")
 		pidFilter  = flag.Uint("p", 0, "trace only PID")
+		uidFilter  = flag.Uint("uid", 0, "trace only UID")
 		commFilter = flag.String("c", "", "trace only COMM (process name)")
+		saddr      = flag.String("saddr", "", "filter TCP source IPv4")
+		daddr      = flag.String("daddr", "", "filter TCP destination IPv4")
+		sport      = flag.Uint("sport", 0, "filter TCP source port")
+		dport      = flag.Uint("dport", 0, "filter TCP destination port")
 		topN       = flag.Int("t", 5, "top-N slowest syscalls in report")
 		jsonOut    = flag.String("o", "", "write JSON snapshot to file")
 		promAddr   = flag.String("prom-addr", ":2112", "prometheus listen address, empty to disable")
@@ -80,7 +92,7 @@ func main() {
 	}
 	defer objs.Close()
 
-	if err := configureFilters(objs.Filters, uint32(*pidFilter), *commFilter); err != nil {
+	if err := configureFilters(objs.Filters, uint32(*pidFilter), uint32(*uidFilter), *commFilter, *saddr, *daddr, uint16(*sport), uint16(*dport)); err != nil {
 		log.Fatalf("configure filter map: %v", err)
 	}
 
@@ -140,7 +152,7 @@ func main() {
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 
-	log.Printf("kernelpulse started interval=%s pid=%d comm=%q topN=%d", interval.String(), *pidFilter, *commFilter, *topN)
+	log.Printf("kernelpulse started interval=%s pid=%d uid=%d comm=%q topN=%d", interval.String(), *pidFilter, *uidFilter, *commFilter, *topN)
 
 	for {
 		select {
@@ -166,12 +178,32 @@ func main() {
 	}
 }
 
-func configureFilters(m *ebpf.Map, pid uint32, comm string) error {
-	cfg := filterConfig{PID: pid}
+func configureFilters(m *ebpf.Map, pid uint32, uid uint32, comm string, saddr string, daddr string, sport uint16, dport uint16) error {
+	cfg := filterConfig{
+		PID:    pid,
+		UID:    uid,
+		Sport:  sport,
+		Dport:  dport,
+		Family: 2,
+	}
 	comm = strings.TrimSpace(comm)
 	if comm != "" {
 		cfg.CommSet = 1
 		copy(cfg.Comm[:], comm)
+	}
+	if saddr != "" {
+		addr, err := netip.ParseAddr(saddr)
+		if err != nil || !addr.Is4() {
+			return fmt.Errorf("invalid saddr: %q", saddr)
+		}
+		cfg.Saddr = ipv4ToU32(addr)
+	}
+	if daddr != "" {
+		addr, err := netip.ParseAddr(daddr)
+		if err != nil || !addr.Is4() {
+			return fmt.Errorf("invalid daddr: %q", daddr)
+		}
+		cfg.Daddr = ipv4ToU32(addr)
 	}
 	key := uint32(0)
 	return m.Update(&key, &cfg, ebpf.UpdateAny)
@@ -216,6 +248,18 @@ func printSnapshot(s collector.Snapshot, counters *counterTracker) {
 		fmt.Println("top slow processes:")
 		for _, row := range s.TopProcesses {
 			fmt.Printf("  pid=%d comm=%s count=%d max=%.3fms avg=%.3fms\n", row.PID, row.Comm, row.Count, row.MaxLatencyMS, row.AvgLatencyMS)
+		}
+	}
+	if len(s.TopComms) > 0 {
+		fmt.Println("top comms by p99:")
+		for _, row := range s.TopComms {
+			fmt.Printf("  comm=%s count=%d p99=%.3fms max=%.3fms avg=%.3fms\n", row.Comm, row.Count, row.P99, row.MaxLatencyMS, row.AvgLatencyMS)
+		}
+	}
+	if len(s.TopExecs) > 0 {
+		fmt.Println("top execs:")
+		for _, row := range s.TopExecs {
+			fmt.Printf("  exec=%s count=%d\n", row.Filename, row.Count)
 		}
 	}
 }
@@ -273,6 +317,11 @@ func verifierHint(err error) string {
 	default:
 		return "run with bpftool prog load --debug to inspect full verifier log"
 	}
+}
+
+func ipv4ToU32(addr netip.Addr) uint32 {
+	b := addr.As4()
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }
 
 type counterTracker struct {

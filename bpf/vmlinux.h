@@ -39,7 +39,24 @@ struct pt_regs {
     __u64 rcx;
 };
 
-struct sock {};
+struct in6_addr {
+    __u32 in6_u_u6_addr32[4];
+};
+
+struct sock_common {
+    __u16 skc_family;
+    __u16 skc_state;
+    __u32 skc_rcv_saddr;
+    __u32 skc_daddr;
+    __u16 skc_num;
+    __u16 skc_dport;
+    struct in6_addr skc_v6_rcv_saddr;
+    struct in6_addr skc_v6_daddr;
+};
+
+struct sock {
+    struct sock_common __sk_common;
+};
 
 struct tcp_sock {
     __u32 srtt_us;
@@ -60,6 +77,8 @@ struct trace_event_raw_tcp_event_sk_skb {
     __u16 sport;
     __u16 dport;
     __u16 _pad;
+    __u32 saddr;
+    __u32 daddr;
 };
 
 struct trace_event_raw_sched_wakeup {
@@ -71,6 +90,11 @@ struct trace_event_raw_sched_switch {
     __u64 unused;
     int prev_pid;
     int next_pid;
+};
+
+struct trace_event_raw_sched_process_exec {
+    __u64 unused;
+    const char *filename;
 };
 
 #endif

@@ -36,10 +36,15 @@ Production-oriented eBPF kernel observability toolkit for Linux.
 - Per-CPU counters (`BPF_MAP_TYPE_PERCPU_ARRAY`)
 - Runtime filtering:
   - `-p` PID filter
+  - `-uid` UID filter
   - `-c` COMM filter
+  - `-saddr` / `-daddr` IPv4 filter (TCP only)
+  - `-sport` / `-dport` port filter (TCP only)
 - Reporting and exports:
   - top-N slow syscalls (`-t`)
   - top-N slow processes (PID/COMM)
+  - top-N comms by p99 latency
+  - top exec filenames (preview)
   - JSON snapshots (`-o output.json`)
   - ASCII heatmap in console
   - Prometheus metrics endpoint
@@ -166,3 +171,8 @@ docker build -t kernelpulse:latest .
 ```
 
 Run container in privileged mode with host kernel interfaces mounted.
+Filter TCP by address/port:
+
+```bash
+sudo ./kernelpulse -saddr 10.0.0.10 -dport 443
+```
