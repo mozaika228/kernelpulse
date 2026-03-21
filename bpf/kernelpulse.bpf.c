@@ -607,7 +607,7 @@ int trace_sched_exec(struct trace_event_raw_sched_process_exec *ctx) {
     }
 
     fill_header(&event->h, EVENT_EXEC);
-    bpf_core_read_str(&event->filename, sizeof(event->filename), BPF_CORE_READ(ctx, filename));
+    bpf_core_read_str(&event->filename, sizeof(event->filename), ctx->filename);
     bpf_ringbuf_submit(event, 0);
     increment_counter(COUNTER_EXEC);
     return 0;
