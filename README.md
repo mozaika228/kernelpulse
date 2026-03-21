@@ -38,13 +38,14 @@ Production-oriented eBPF kernel observability toolkit for Linux.
   - `-p` PID filter
   - `-uid` UID filter
   - `-c` COMM filter
-  - `-saddr` / `-daddr` IPv4 filter (TCP only)
+  - `-saddr` / `-daddr` IPv4/IPv6 filter (TCP only)
   - `-sport` / `-dport` port filter (TCP only)
 - Reporting and exports:
   - top-N slow syscalls (`-t`)
   - top-N slow processes (PID/COMM)
   - top-N comms by p99 latency
   - top exec filenames (preview)
+  - top TCP 5‑tuples (retransmits + RTT p99)
   - JSON snapshots (`-o output.json`)
   - ASCII heatmap in console
   - Prometheus metrics endpoint
@@ -175,4 +176,10 @@ Filter TCP by address/port:
 
 ```bash
 sudo ./kernelpulse -saddr 10.0.0.10 -dport 443
+```
+
+IPv6 filter example:
+
+```bash
+sudo ./kernelpulse -saddr 2001:db8::1 -daddr 2001:db8::2 -sport 443
 ```

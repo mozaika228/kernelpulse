@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -47,6 +48,8 @@ type TCPRetransmitEvent struct {
 	_      uint16
 	Saddr  uint32
 	Daddr  uint32
+	SaddrV6 [4]uint32
+	DaddrV6 [4]uint32
 }
 
 type TCPRTTEvent struct {
@@ -57,6 +60,8 @@ type TCPRTTEvent struct {
 	_      uint16
 	Saddr  uint32
 	Daddr  uint32
+	SaddrV6 [4]uint32
+	DaddrV6 [4]uint32
 	SRTTus uint32
 	_      [4]byte
 }
@@ -132,6 +137,7 @@ type Snapshot struct {
 	TopProcesses   []ProcTop         `json:"top_processes"`
 	TopComms       []CommTop         `json:"top_comms"`
 	TopExecs       []ExecTop         `json:"top_execs"`
+	TopTCPTuples   []TCPTupleTop     `json:"top_tcp_tuples"`
 }
 
 type syscallAgg struct {
@@ -147,13 +153,6 @@ type procAgg struct {
 	max   uint64
 }
 
-type commAgg struct {
-	count uint64
-	total uint64
-	max   uint64
-	hist  *hdrhistogram.Histogram
-}
-
 type execAgg struct {
 	count uint64
 }
@@ -161,6 +160,31 @@ type execAgg struct {
 type ExecTop struct {
 	Filename string `json:"filename"`
 	Count    uint64 `json:"count"`
+}
+
+type TCPTuple struct {
+	Family  uint16
+	Sport   uint16
+	Dport   uint16
+	Saddr4  uint32
+	Daddr4  uint32
+	Saddr6  [16]byte
+	Daddr6  [16]byte
+}
+
+type tcpAgg struct {
+	retrans uint64
+	rttHist *hdrhistogram.Histogram
+}
+
+type TCPTupleTop struct {
+	Family     string  `json:"family"`
+	Saddr      string  `json:"saddr"`
+	Daddr      string  `json:"daddr"`
+	Sport      uint16  `json:"sport"`
+	Dport      uint16  `json:"dport"`
+	Retransmit uint64  `json:"retransmits"`
+	RTTP99     float64 `json:"rtt_p99_ms"`
 }
 
 type Aggregator struct {
@@ -178,8 +202,10 @@ type Aggregator struct {
 	syscallHeatmap map[string]uint64
 	syscallAgg     map[uint32]*syscallAgg
 	procAgg        map[uint32]*procAgg
-	commAgg        map[string]*commAgg
 	execAgg        map[string]*execAgg
+	tcpAgg         map[TCPTuple]*tcpAgg
+
+	topCommsOverride []CommTop
 
 	syscallHist *hdrhistogram.Histogram
 	tcpRTTHist  *hdrhistogram.Histogram
@@ -192,8 +218,8 @@ func NewAggregator() *Aggregator {
 		syscallHeatmap: map[string]uint64{},
 		syscallAgg:     map[uint32]*syscallAgg{},
 		procAgg:        map[uint32]*procAgg{},
-		commAgg:        map[string]*commAgg{},
 		execAgg:        map[string]*execAgg{},
+		tcpAgg:         map[TCPTuple]*tcpAgg{},
 		syscallHist:    hdrhistogram.New(1, 60_000_000, 3), // us
 		tcpRTTHist:     hdrhistogram.New(1, 30_000_000, 3), // us
 		runQHist:       hdrhistogram.New(1, 30_000_000, 3), // us
@@ -263,6 +289,7 @@ func (a *Aggregator) SnapshotAndReset(topN int) Snapshot {
 		TopProcesses:   a.topProcesses(topN),
 		TopComms:       a.topComms(topN),
 		TopExecs:       a.topExecs(topN),
+		TopTCPTuples:   a.topTCPTuples(topN),
 	}
 
 	a.windowStart = end
@@ -275,8 +302,9 @@ func (a *Aggregator) SnapshotAndReset(topN int) Snapshot {
 	clear(a.syscallHeatmap)
 	clear(a.syscallAgg)
 	clear(a.procAgg)
-	clear(a.commAgg)
 	clear(a.execAgg)
+	clear(a.tcpAgg)
+	a.topCommsOverride = nil
 	a.syscallHist.Reset()
 	a.tcpRTTHist.Reset()
 	a.runQHist.Reset()
@@ -318,24 +346,6 @@ func (a *Aggregator) observeSyscall(raw []byte) error {
 		pagg.max = e.LatencyNs
 	}
 
-	comm := commString(e.Comm)
-	if comm != "" {
-		cagg := a.commAgg[comm]
-		if cagg == nil {
-			if len(a.commAgg) < 256 {
-				cagg = &commAgg{hist: hdrhistogram.New(1, 60_000_000, 3)}
-				a.commAgg[comm] = cagg
-			}
-		}
-		if cagg != nil {
-			cagg.count++
-			cagg.total += e.LatencyNs
-			if e.LatencyNs > cagg.max {
-				cagg.max = e.LatencyNs
-			}
-			_ = cagg.hist.RecordValue(int64(us))
-		}
-	}
 	return nil
 }
 
@@ -346,6 +356,15 @@ func (a *Aggregator) observeTCPRetransmit(raw []byte) error {
 	}
 	a.mu.Lock()
 	a.tcpRetransmits++
+	if len(a.tcpAgg) < 2048 {
+		key := tupleFromRetransmit(e)
+		agg := a.tcpAgg[key]
+		if agg == nil {
+			agg = &tcpAgg{rttHist: hdrhistogram.New(1, 30_000_000, 3)}
+			a.tcpAgg[key] = agg
+		}
+		agg.retrans++
+	}
 	a.mu.Unlock()
 	return nil
 }
@@ -357,6 +376,15 @@ func (a *Aggregator) observeTCPRTT(raw []byte) error {
 	}
 	a.mu.Lock()
 	_ = a.tcpRTTHist.RecordValue(int64(maxU64(1, uint64(e.SRTTus))))
+	if len(a.tcpAgg) < 2048 {
+		key := tupleFromRTT(e)
+		agg := a.tcpAgg[key]
+		if agg == nil {
+			agg = &tcpAgg{rttHist: hdrhistogram.New(1, 30_000_000, 3)}
+			a.tcpAgg[key] = agg
+		}
+		_ = agg.rttHist.RecordValue(int64(maxU64(1, uint64(e.SRTTus))))
+	}
 	a.mu.Unlock()
 	return nil
 }
@@ -404,6 +432,12 @@ func (a *Aggregator) observeExec(raw []byte) error {
 	return nil
 }
 
+func (a *Aggregator) SetTopComms(top []CommTop) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.topCommsOverride = top
+}
+
 func (a *Aggregator) topSyscalls(topN int) []SyscallTop {
 	out := make([]SyscallTop, 0, len(a.syscallAgg))
 	for id, agg := range a.syscallAgg {
@@ -446,28 +480,10 @@ func (a *Aggregator) topProcesses(topN int) []ProcTop {
 }
 
 func (a *Aggregator) topComms(topN int) []CommTop {
-	out := make([]CommTop, 0, len(a.commAgg))
-	for comm, agg := range a.commAgg {
-		if agg.count == 0 {
-			continue
-		}
-		p99 := 0.0
-		if agg.hist != nil && agg.hist.TotalCount() > 0 {
-			p99 = float64(agg.hist.ValueAtQuantile(99.0)) / 1000
-		}
-		out = append(out, CommTop{
-			Comm:         comm,
-			Count:        agg.count,
-			P99:          p99,
-			MaxLatencyMS: float64(agg.max) / 1_000_000,
-			AvgLatencyMS: float64(agg.total) / float64(agg.count) / 1_000_000,
-		})
+	if a.topCommsOverride != nil {
+		return a.topCommsOverride
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].P99 > out[j].P99 })
-	if topN > 0 && len(out) > topN {
-		return out[:topN]
-	}
-	return out
+	return nil
 }
 
 func (a *Aggregator) topExecs(topN int) []ExecTop {
@@ -476,6 +492,36 @@ func (a *Aggregator) topExecs(topN int) []ExecTop {
 		out = append(out, ExecTop{Filename: name, Count: agg.count})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Count > out[j].Count })
+	if topN > 0 && len(out) > topN {
+		return out[:topN]
+	}
+	return out
+}
+
+func (a *Aggregator) topTCPTuples(topN int) []TCPTupleTop {
+	out := make([]TCPTupleTop, 0, len(a.tcpAgg))
+	for tuple, agg := range a.tcpAgg {
+		p99 := 0.0
+		if agg.rttHist != nil && agg.rttHist.TotalCount() > 0 {
+			p99 = float64(agg.rttHist.ValueAtQuantile(99.0)) / 1000
+		}
+		saddr, daddr, fam := formatTuple(tuple)
+		out = append(out, TCPTupleTop{
+			Family:     fam,
+			Saddr:      saddr,
+			Daddr:      daddr,
+			Sport:      tuple.Sport,
+			Dport:      tuple.Dport,
+			Retransmit: agg.retrans,
+			RTTP99:     p99,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Retransmit == out[j].Retransmit {
+			return out[i].RTTP99 > out[j].RTTP99
+		}
+		return out[i].Retransmit > out[j].Retransmit
+	})
 	if topN > 0 && len(out) > topN {
 		return out[:topN]
 	}
@@ -548,6 +594,72 @@ func syscallName(id uint32) string {
 func commString(raw [16]byte) string {
 	s := string(raw[:])
 	return strings.TrimRight(s, "\x00")
+}
+
+func tupleFromRetransmit(e TCPRetransmitEvent) TCPTuple {
+	t := TCPTuple{
+		Family: e.Family,
+		Sport:  e.LPort,
+		Dport:  e.DPort,
+		Saddr4: e.Saddr,
+		Daddr4: e.Daddr,
+	}
+	if e.Family == 10 {
+		copy(t.Saddr6[:], v6ToBytes(e.SaddrV6))
+		copy(t.Daddr6[:], v6ToBytes(e.DaddrV6))
+	}
+	return t
+}
+
+func tupleFromRTT(e TCPRTTEvent) TCPTuple {
+	t := TCPTuple{
+		Family: e.Family,
+		Sport:  e.Sport,
+		Dport:  e.Dport,
+		Saddr4: e.Saddr,
+		Daddr4: e.Daddr,
+	}
+	if e.Family == 10 {
+		copy(t.Saddr6[:], v6ToBytes(e.SaddrV6))
+		copy(t.Daddr6[:], v6ToBytes(e.DaddrV6))
+	}
+	return t
+}
+
+func v6ToBytes(v [4]uint32) [16]byte {
+	var out [16]byte
+	out[0] = byte(v[0] >> 24)
+	out[1] = byte(v[0] >> 16)
+	out[2] = byte(v[0] >> 8)
+	out[3] = byte(v[0])
+	out[4] = byte(v[1] >> 24)
+	out[5] = byte(v[1] >> 16)
+	out[6] = byte(v[1] >> 8)
+	out[7] = byte(v[1])
+	out[8] = byte(v[2] >> 24)
+	out[9] = byte(v[2] >> 16)
+	out[10] = byte(v[2] >> 8)
+	out[11] = byte(v[2])
+	out[12] = byte(v[3] >> 24)
+	out[13] = byte(v[3] >> 16)
+	out[14] = byte(v[3] >> 8)
+	out[15] = byte(v[3])
+	return out
+}
+
+func formatTuple(t TCPTuple) (string, string, string) {
+	if t.Family == 10 {
+		s := netip.AddrFrom16(t.Saddr6).String()
+		d := netip.AddrFrom16(t.Daddr6).String()
+		return s, d, "ipv6"
+	}
+	s := netip.AddrFrom4(u32ToV4(t.Saddr4)).String()
+	d := netip.AddrFrom4(u32ToV4(t.Daddr4)).String()
+	return s, d, "ipv4"
+}
+
+func u32ToV4(v uint32) [4]byte {
+	return [4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
 }
 
 func cloneMap(in map[string]uint64) map[string]uint64 {

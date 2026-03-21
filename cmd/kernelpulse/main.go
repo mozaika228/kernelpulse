@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -33,6 +34,8 @@ type filterConfig struct {
 	UID     uint32
 	Saddr   uint32
 	Daddr   uint32
+	SaddrV6 [4]uint32
+	DaddrV6 [4]uint32
 	Sport   uint16
 	Dport   uint16
 	Family  uint16
@@ -58,10 +61,10 @@ var (
 
 func main() {
 	var (
-		interval   = flag.Duration("interval", 5*time.Second, "report interval")
-		pidFilter  = flag.Uint("p", 0, "trace only PID")
-		uidFilter  = flag.Uint("uid", 0, "trace only UID")
-		commFilter = flag.String("c", "", "trace only COMM (process name)")
+	interval   = flag.Duration("interval", 5*time.Second, "report interval")
+	pidFilter  = flag.Uint("p", 0, "trace only PID")
+	uidFilter  = flag.Uint("uid", 0, "trace only UID")
+	commFilter = flag.String("c", "", "trace only COMM (process name)")
 		saddr      = flag.String("saddr", "", "filter TCP source IPv4")
 		daddr      = flag.String("daddr", "", "filter TCP destination IPv4")
 		sport      = flag.Uint("sport", 0, "filter TCP source port")
@@ -168,6 +171,11 @@ func main() {
 			if err := counters.collect(objs.Counters); err == nil {
 				agg.ObserveRingbufDrops(counters.delta(3))
 			}
+			if objs.CommHist != nil {
+				if topComms, err := collectCommHistogram(objs.CommHist, *topN); err == nil {
+					agg.SetTopComms(topComms)
+				}
+			}
 			snapshot := agg.SnapshotAndReset(*topN)
 			updateMetrics(snapshot)
 			printSnapshot(snapshot, counters)
@@ -184,7 +192,6 @@ func configureFilters(m *ebpf.Map, pid uint32, uid uint32, comm string, saddr st
 		UID:    uid,
 		Sport:  sport,
 		Dport:  dport,
-		Family: 2,
 	}
 	comm = strings.TrimSpace(comm)
 	if comm != "" {
@@ -193,17 +200,48 @@ func configureFilters(m *ebpf.Map, pid uint32, uid uint32, comm string, saddr st
 	}
 	if saddr != "" {
 		addr, err := netip.ParseAddr(saddr)
-		if err != nil || !addr.Is4() {
+		if err != nil {
 			return fmt.Errorf("invalid saddr: %q", saddr)
 		}
-		cfg.Saddr = ipv4ToU32(addr)
+		if addr.Is4() {
+			if cfg.Family != 0 && cfg.Family != 2 {
+				return fmt.Errorf("saddr is IPv4 but family is IPv6")
+			}
+			cfg.Family = 2
+			cfg.Saddr = ipv4ToU32(addr)
+		} else {
+			if cfg.Family != 0 && cfg.Family != 10 {
+				return fmt.Errorf("saddr is IPv6 but family is IPv4")
+			}
+			cfg.Family = 10
+			cfg.SaddrV6 = ipv6ToU32s(addr)
+		}
 	}
 	if daddr != "" {
 		addr, err := netip.ParseAddr(daddr)
-		if err != nil || !addr.Is4() {
+		if err != nil {
 			return fmt.Errorf("invalid daddr: %q", daddr)
 		}
-		cfg.Daddr = ipv4ToU32(addr)
+		if addr.Is4() {
+			if cfg.Family != 0 && cfg.Family != 2 {
+				return fmt.Errorf("daddr is IPv4 but family is IPv6")
+			}
+			if cfg.Family == 0 {
+				cfg.Family = 2
+			}
+			cfg.Daddr = ipv4ToU32(addr)
+		} else {
+			if cfg.Family != 0 && cfg.Family != 10 {
+				return fmt.Errorf("daddr is IPv6 but family is IPv4")
+			}
+			if cfg.Family == 0 {
+				cfg.Family = 10
+			}
+			cfg.DaddrV6 = ipv6ToU32s(addr)
+		}
+	}
+	if cfg.Family == 0 && (sport != 0 || dport != 0) {
+		cfg.Family = 2
 	}
 	key := uint32(0)
 	return m.Update(&key, &cfg, ebpf.UpdateAny)
@@ -260,6 +298,13 @@ func printSnapshot(s collector.Snapshot, counters *counterTracker) {
 		fmt.Println("top execs:")
 		for _, row := range s.TopExecs {
 			fmt.Printf("  exec=%s count=%d\n", row.Filename, row.Count)
+		}
+	}
+	if len(s.TopTCPTuples) > 0 {
+		fmt.Println("top tcp tuples:")
+		for _, row := range s.TopTCPTuples {
+			fmt.Printf("  %s %s:%d -> %s:%d retrans=%d rtt_p99=%.3fms\n",
+				row.Family, row.Saddr, row.Sport, row.Daddr, row.Dport, row.Retransmit, row.RTTP99)
 		}
 	}
 }
@@ -322,6 +367,164 @@ func verifierHint(err error) string {
 func ipv4ToU32(addr netip.Addr) uint32 {
 	b := addr.As4()
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+func ipv6ToU32s(addr netip.Addr) [4]uint32 {
+	b := addr.As16()
+	return [4]uint32{
+		uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]),
+		uint32(b[4])<<24 | uint32(b[5])<<16 | uint32(b[6])<<8 | uint32(b[7]),
+		uint32(b[8])<<24 | uint32(b[9])<<16 | uint32(b[10])<<8 | uint32(b[11]),
+		uint32(b[12])<<24 | uint32(b[13])<<16 | uint32(b[14])<<8 | uint32(b[15]),
+	}
+}
+
+type commHistKey struct {
+	Comm   [16]byte
+	Bucket uint32
+}
+
+func collectCommHistogram(m *ebpf.Map, topN int) ([]collector.CommTop, error) {
+	iter := m.Iterate()
+	var key commHistKey
+	var val uint64
+	type hist struct {
+		buckets [10]uint64
+	}
+	hists := map[string]*hist{}
+
+	for iter.Next(&key, &val) {
+		comm := strings.TrimRight(string(key.Comm[:]), "\x00")
+		if comm == "" {
+			continue
+		}
+		h := hists[comm]
+		if h == nil {
+			h = &hist{}
+			hists[comm] = h
+		}
+		if key.Bucket < 10 {
+			h.buckets[key.Bucket] += val
+		}
+		_ = m.Delete(&key)
+	}
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]collector.CommTop, 0, len(hists))
+	for comm, h := range hists {
+		total := uint64(0)
+		for _, c := range h.buckets {
+			total += c
+		}
+		if total == 0 {
+			continue
+		}
+		p99us := bucketP99Us(h.buckets, total)
+		avgus := bucketAvgUs(h.buckets, total)
+		maxus := bucketMaxUs(h.buckets)
+		out = append(out, collector.CommTop{
+			Comm:         comm,
+			Count:        total,
+			P99:          float64(p99us) / 1000,
+			MaxLatencyMS: float64(maxus) / 1000,
+			AvgLatencyMS: float64(avgus) / 1000,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].P99 > out[j].P99 })
+	if topN > 0 && len(out) > topN {
+		return out[:topN], nil
+	}
+	return out, nil
+}
+
+func bucketUpperUs(i int) uint64 {
+	switch i {
+	case 0:
+		return 1
+	case 1:
+		return 5
+	case 2:
+		return 10
+	case 3:
+		return 50
+	case 4:
+		return 100
+	case 5:
+		return 500
+	case 6:
+		return 1000
+	case 7:
+		return 5000
+	case 8:
+		return 10000
+	default:
+		return 20000
+	}
+}
+
+func bucketMidUs(i int) uint64 {
+	switch i {
+	case 0:
+		return 1
+	case 1:
+		return 3
+	case 2:
+		return 8
+	case 3:
+		return 30
+	case 4:
+		return 75
+	case 5:
+		return 300
+	case 6:
+		return 750
+	case 7:
+		return 3000
+	case 8:
+		return 7500
+	default:
+		return 15000
+	}
+}
+
+func bucketP99Us(buckets [10]uint64, total uint64) uint64 {
+	target := uint64(float64(total) * 0.99)
+	if target == 0 {
+		target = 1
+	}
+	var cum uint64
+	for i, c := range buckets {
+		cum += c
+		if cum >= target {
+			return bucketUpperUs(i)
+		}
+	}
+	return bucketUpperUs(9)
+}
+
+func bucketAvgUs(buckets [10]uint64, total uint64) uint64 {
+	var sum uint64
+	for i, c := range buckets {
+		sum += bucketMidUs(i) * c
+	}
+	if total == 0 {
+		return 0
+	}
+	return sum / total
+}
+
+func bucketMaxUs(buckets [10]uint64) uint64 {
+	for i := 9; i >= 0; i-- {
+		if buckets[i] > 0 {
+			return bucketUpperUs(i)
+		}
+		if i == 0 {
+			break
+		}
+	}
+	return 0
 }
 
 type counterTracker struct {

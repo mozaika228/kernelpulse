@@ -79,6 +79,8 @@ struct trace_event_raw_tcp_event_sk_skb {
     __u16 _pad;
     __u32 saddr;
     __u32 daddr;
+    __u32 saddr_v6[4];
+    __u32 daddr_v6[4];
 };
 
 struct trace_event_raw_sched_wakeup {

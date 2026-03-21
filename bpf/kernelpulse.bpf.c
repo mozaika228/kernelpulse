@@ -23,6 +23,12 @@
 #ifndef AF_INET
 #define AF_INET 2
 #endif
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
+#ifndef BPF_MAP_TYPE_LRU_HASH
+#define BPF_MAP_TYPE_LRU_HASH 10
+#endif
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
@@ -52,6 +58,8 @@ struct filter_config {
     __u32 uid;
     __u32 saddr;
     __u32 daddr;
+    __u32 saddr_v6[4];
+    __u32 daddr_v6[4];
     __u16 sport;
     __u16 dport;
     __u16 family;
@@ -84,6 +92,8 @@ struct tcp_retransmit_event {
     __u16 _pad1;
     __u32 saddr;
     __u32 daddr;
+    __u32 saddr_v6[4];
+    __u32 daddr_v6[4];
 };
 
 struct tcp_rtt_event {
@@ -94,6 +104,8 @@ struct tcp_rtt_event {
     __u16 _pad1;
     __u32 saddr;
     __u32 daddr;
+    __u32 saddr_v6[4];
+    __u32 daddr_v6[4];
     __u32 srtt_us;
 };
 
@@ -147,6 +159,18 @@ struct {
     __uint(max_entries, 1 << 24);
 } events SEC(".maps");
 
+struct comm_hist_key {
+    char comm[16];
+    __u32 bucket;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, struct comm_hist_key);
+    __type(value, __u64);
+} comm_hist SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 64);
@@ -172,6 +196,10 @@ static __always_inline int str_eq_16(const char a[16], const char b[16]) {
         }
     }
     return 1;
+}
+
+static __always_inline int v6_eq(const __u32 a[4], const __u32 b[4]) {
+    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
 }
 
 static __always_inline int pass_filter(void) {
@@ -218,11 +246,28 @@ static __always_inline int pass_tcp_filter(__u16 family, __u16 sport, __u16 dpor
     if (f->dport != 0 && f->dport != dport) {
         return 0;
     }
-    if (f->saddr != 0 && f->saddr != saddr) {
-        return 0;
+    if (family == AF_INET) {
+        if (f->saddr != 0 && f->saddr != saddr) {
+            return 0;
+        }
+        if (f->daddr != 0 && f->daddr != daddr) {
+            return 0;
+        }
     }
-    if (f->daddr != 0 && f->daddr != daddr) {
-        return 0;
+    return 1;
+}
+
+static __always_inline int pass_tcp_filter_v6(const __u32 saddr_v6[4], const __u32 daddr_v6[4]) {
+    __u32 key = 0;
+    struct filter_config *f = bpf_map_lookup_elem(&filters, &key);
+    if (!f) {
+        return 1;
+    }
+    if (!v6_eq(f->saddr_v6, saddr_v6)) {
+        return f->saddr_v6[0] == 0 && f->saddr_v6[1] == 0 && f->saddr_v6[2] == 0 && f->saddr_v6[3] == 0;
+    }
+    if (!v6_eq(f->daddr_v6, daddr_v6)) {
+        return f->daddr_v6[0] == 0 && f->daddr_v6[1] == 0 && f->daddr_v6[2] == 0 && f->daddr_v6[3] == 0;
     }
     return 1;
 }
@@ -234,6 +279,29 @@ static __always_inline void fill_header(struct event_header *h, __u8 kind) {
     h->pid = pid_tgid >> 32;
     h->cpu = bpf_get_smp_processor_id();
     bpf_get_current_comm(&h->comm, sizeof(h->comm));
+}
+
+static __always_inline __u32 latency_bucket_us(__u64 us) {
+    if (us < 1) {
+        return 0;
+    } else if (us < 5) {
+        return 1;
+    } else if (us < 10) {
+        return 2;
+    } else if (us < 50) {
+        return 3;
+    } else if (us < 100) {
+        return 4;
+    } else if (us < 500) {
+        return 5;
+    } else if (us < 1000) {
+        return 6;
+    } else if (us < 5000) {
+        return 7;
+    } else if (us < 10000) {
+        return 8;
+    }
+    return 9;
 }
 
 SEC("tracepoint/raw_syscalls/sys_enter")
@@ -288,6 +356,22 @@ int trace_sys_exit(struct trace_event_raw_sys_exit *ctx) {
     event->latency_ns = now - v->start_ts_ns;
     bpf_ringbuf_submit(event, 0);
 
+    // Per-COMM histogram in kernel
+    {
+        struct comm_hist_key key = {};
+        __u32 bucket = latency_bucket_us(event->latency_ns / 1000);
+        __u64 *cnt;
+        key.bucket = bucket;
+        bpf_get_current_comm(&key.comm, sizeof(key.comm));
+        cnt = bpf_map_lookup_elem(&comm_hist, &key);
+        if (cnt) {
+            __sync_fetch_and_add(cnt, 1);
+        } else {
+            __u64 one = 1;
+            bpf_map_update_elem(&comm_hist, &key, &one, BPF_ANY);
+        }
+    }
+
     bpf_map_delete_elem(&syscall_start, &pid_tgid);
     increment_counter(COUNTER_SYS_EXIT);
     return 0;
@@ -301,6 +385,8 @@ int trace_tcp_retransmit(struct trace_event_raw_tcp_event_sk_skb *ctx) {
     __u16 dport;
     __u32 saddr;
     __u32 daddr;
+    __u32 saddr_v6[4] = {};
+    __u32 daddr_v6[4] = {};
 
     if (!pass_filter()) {
         return 0;
@@ -311,8 +397,19 @@ int trace_tcp_retransmit(struct trace_event_raw_tcp_event_sk_skb *ctx) {
     dport = bpf_ntohs(BPF_CORE_READ(ctx, dport));
     saddr = BPF_CORE_READ(ctx, saddr);
     daddr = BPF_CORE_READ(ctx, daddr);
-    if (!pass_tcp_filter(family, sport, dport, saddr, daddr)) {
-        return 0;
+    if (family == AF_INET6) {
+        bpf_core_read(&saddr_v6, sizeof(saddr_v6), BPF_CORE_READ(ctx, saddr_v6));
+        bpf_core_read(&daddr_v6, sizeof(daddr_v6), BPF_CORE_READ(ctx, daddr_v6));
+        if (!pass_tcp_filter(family, sport, dport, saddr, daddr)) {
+            return 0;
+        }
+        if (!pass_tcp_filter_v6(saddr_v6, daddr_v6)) {
+            return 0;
+        }
+    } else {
+        if (!pass_tcp_filter(family, sport, dport, saddr, daddr)) {
+            return 0;
+        }
     }
 
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
@@ -327,6 +424,8 @@ int trace_tcp_retransmit(struct trace_event_raw_tcp_event_sk_skb *ctx) {
     event->dport = dport;
     event->saddr = saddr;
     event->daddr = daddr;
+    __builtin_memcpy(event->saddr_v6, saddr_v6, sizeof(saddr_v6));
+    __builtin_memcpy(event->daddr_v6, daddr_v6, sizeof(daddr_v6));
     bpf_ringbuf_submit(event, 0);
     increment_counter(COUNTER_TCP_RETRANS);
     return 0;
@@ -341,6 +440,8 @@ int BPF_KPROBE(trace_tcp_rtt, struct sock *sk) {
     __u16 dport;
     __u32 saddr;
     __u32 daddr;
+    __u32 saddr_v6[4] = {};
+    __u32 daddr_v6[4] = {};
     __u32 srtt = 0;
 
     if (!pass_filter()) {
@@ -348,15 +449,23 @@ int BPF_KPROBE(trace_tcp_rtt, struct sock *sk) {
     }
 
     family = BPF_CORE_READ(sk, __sk_common.skc_family);
-    if (family != AF_INET) {
-        return 0;
-    }
     sport = BPF_CORE_READ(sk, __sk_common.skc_num);
     dport = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
     saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
     daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
-    if (!pass_tcp_filter(family, sport, dport, saddr, daddr)) {
-        return 0;
+    if (family == AF_INET6) {
+        bpf_core_read(&saddr_v6, sizeof(saddr_v6), BPF_CORE_READ(sk, __sk_common.skc_v6_rcv_saddr.in6_u_u6_addr32));
+        bpf_core_read(&daddr_v6, sizeof(daddr_v6), BPF_CORE_READ(sk, __sk_common.skc_v6_daddr.in6_u_u6_addr32));
+        if (!pass_tcp_filter(family, sport, dport, saddr, daddr)) {
+            return 0;
+        }
+        if (!pass_tcp_filter_v6(saddr_v6, daddr_v6)) {
+            return 0;
+        }
+    } else {
+        if (!pass_tcp_filter(family, sport, dport, saddr, daddr)) {
+            return 0;
+        }
     }
 
     srtt = BPF_CORE_READ(tp, srtt_us);
@@ -376,6 +485,8 @@ int BPF_KPROBE(trace_tcp_rtt, struct sock *sk) {
     event->dport = dport;
     event->saddr = saddr;
     event->daddr = daddr;
+    __builtin_memcpy(event->saddr_v6, saddr_v6, sizeof(saddr_v6));
+    __builtin_memcpy(event->daddr_v6, daddr_v6, sizeof(daddr_v6));
     event->srtt_us = srtt >> 3;
     bpf_ringbuf_submit(event, 0);
     increment_counter(COUNTER_TCP_RTT);
