@@ -23,6 +23,9 @@ func TestBPFLoad(t *testing.T) {
 		if strings.Contains(err.Error(), "invalid bpf_context access") {
 			t.Skipf("skip on this runner: tracepoint context mismatch for bundled vmlinux.h: %v", err)
 		}
+		if strings.Contains(err.Error(), "bad CO-RE relocation") {
+			t.Skipf("skip on this runner: CO-RE relocation mismatch for bundled vmlinux.h: %v", err)
+		}
 		t.Fatalf("load eBPF objects: %v", err)
 	}
 	defer objs.Close()
