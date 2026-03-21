@@ -387,6 +387,8 @@ int trace_tcp_retransmit(struct trace_event_raw_tcp_event_sk_skb *ctx) {
     __u32 daddr;
     __u32 saddr_v6[4] = {};
     __u32 daddr_v6[4] = {};
+    struct in6_addr saddr6 = {};
+    struct in6_addr daddr6 = {};
 
     if (!pass_filter()) {
         return 0;
@@ -398,8 +400,10 @@ int trace_tcp_retransmit(struct trace_event_raw_tcp_event_sk_skb *ctx) {
     saddr = BPF_CORE_READ(ctx, saddr);
     daddr = BPF_CORE_READ(ctx, daddr);
     if (family == AF_INET6) {
-        bpf_core_read(&saddr_v6, sizeof(saddr_v6), BPF_CORE_READ(ctx, saddr_v6));
-        bpf_core_read(&daddr_v6, sizeof(daddr_v6), BPF_CORE_READ(ctx, daddr_v6));
+        bpf_core_read(&saddr6, sizeof(saddr6), &ctx->saddr_v6);
+        bpf_core_read(&daddr6, sizeof(daddr6), &ctx->daddr_v6);
+        __builtin_memcpy(saddr_v6, saddr6.in6_u_u6_addr32, sizeof(saddr_v6));
+        __builtin_memcpy(daddr_v6, daddr6.in6_u_u6_addr32, sizeof(daddr_v6));
         if (!pass_tcp_filter(family, sport, dport, saddr, daddr)) {
             return 0;
         }
@@ -442,6 +446,8 @@ int BPF_KPROBE(trace_tcp_rtt, struct sock *sk) {
     __u32 daddr;
     __u32 saddr_v6[4] = {};
     __u32 daddr_v6[4] = {};
+    struct in6_addr saddr6 = {};
+    struct in6_addr daddr6 = {};
     __u32 srtt = 0;
 
     if (!pass_filter()) {
@@ -454,8 +460,10 @@ int BPF_KPROBE(trace_tcp_rtt, struct sock *sk) {
     saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
     daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
     if (family == AF_INET6) {
-        bpf_core_read(&saddr_v6, sizeof(saddr_v6), BPF_CORE_READ(sk, __sk_common.skc_v6_rcv_saddr.in6_u_u6_addr32));
-        bpf_core_read(&daddr_v6, sizeof(daddr_v6), BPF_CORE_READ(sk, __sk_common.skc_v6_daddr.in6_u_u6_addr32));
+        bpf_core_read(&saddr6, sizeof(saddr6), &sk->__sk_common.skc_v6_rcv_saddr);
+        bpf_core_read(&daddr6, sizeof(daddr6), &sk->__sk_common.skc_v6_daddr);
+        __builtin_memcpy(saddr_v6, saddr6.in6_u_u6_addr32, sizeof(saddr_v6));
+        __builtin_memcpy(daddr_v6, daddr6.in6_u_u6_addr32, sizeof(daddr_v6));
         if (!pass_tcp_filter(family, sport, dport, saddr, daddr)) {
             return 0;
         }
