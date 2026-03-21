@@ -77,6 +77,14 @@ type SyscallTop struct {
 	AvgLatencyMS float64 `json:"avg_latency_ms"`
 }
 
+type ProcTop struct {
+	PID          uint32  `json:"pid"`
+	Comm         string  `json:"comm"`
+	Count        uint64  `json:"count"`
+	MaxLatencyMS float64 `json:"max_latency_ms"`
+	AvgLatencyMS float64 `json:"avg_latency_ms"`
+}
+
 type Percentiles struct {
 	P50 float64 `json:"p50"`
 	P95 float64 `json:"p95"`
@@ -104,9 +112,17 @@ type Snapshot struct {
 
 	SyscallHeatmap map[string]uint64 `json:"syscall_heatmap"`
 	TopSyscalls    []SyscallTop      `json:"top_syscalls"`
+	TopProcesses   []ProcTop         `json:"top_processes"`
 }
 
 type syscallAgg struct {
+	count uint64
+	total uint64
+	max   uint64
+}
+
+type procAgg struct {
+	comm  string
 	count uint64
 	total uint64
 	max   uint64
@@ -126,6 +142,7 @@ type Aggregator struct {
 
 	syscallHeatmap map[string]uint64
 	syscallAgg     map[uint32]*syscallAgg
+	procAgg        map[uint32]*procAgg
 
 	syscallHist *hdrhistogram.Histogram
 	tcpRTTHist  *hdrhistogram.Histogram
@@ -137,6 +154,7 @@ func NewAggregator() *Aggregator {
 		windowStart:    time.Now(),
 		syscallHeatmap: map[string]uint64{},
 		syscallAgg:     map[uint32]*syscallAgg{},
+		procAgg:        map[uint32]*procAgg{},
 		syscallHist:    hdrhistogram.New(1, 60_000_000, 3), // us
 		tcpRTTHist:     hdrhistogram.New(1, 30_000_000, 3), // us
 		runQHist:       hdrhistogram.New(1, 30_000_000, 3), // us
@@ -203,6 +221,7 @@ func (a *Aggregator) SnapshotAndReset(topN int) Snapshot {
 		RunQLatency:    percentileMS(a.runQHist),
 		SyscallHeatmap: cloneMap(a.syscallHeatmap),
 		TopSyscalls:    a.topSyscalls(topN),
+		TopProcesses:   a.topProcesses(topN),
 	}
 
 	a.windowStart = end
@@ -214,6 +233,7 @@ func (a *Aggregator) SnapshotAndReset(topN int) Snapshot {
 	a.ringbufDrops = 0
 	clear(a.syscallHeatmap)
 	clear(a.syscallAgg)
+	clear(a.procAgg)
 	a.syscallHist.Reset()
 	a.tcpRTTHist.Reset()
 	a.runQHist.Reset()
@@ -242,6 +262,17 @@ func (a *Aggregator) observeSyscall(raw []byte) error {
 	agg.total += e.LatencyNs
 	if e.LatencyNs > agg.max {
 		agg.max = e.LatencyNs
+	}
+
+	pagg := a.procAgg[e.PID]
+	if pagg == nil {
+		pagg = &procAgg{comm: commString(e.Comm)}
+		a.procAgg[e.PID] = pagg
+	}
+	pagg.count++
+	pagg.total += e.LatencyNs
+	if e.LatencyNs > pagg.max {
+		pagg.max = e.LatencyNs
 	}
 	return nil
 }
@@ -322,6 +353,27 @@ func (a *Aggregator) topSyscalls(topN int) []SyscallTop {
 	return out
 }
 
+func (a *Aggregator) topProcesses(topN int) []ProcTop {
+	out := make([]ProcTop, 0, len(a.procAgg))
+	for pid, agg := range a.procAgg {
+		if agg.count == 0 {
+			continue
+		}
+		out = append(out, ProcTop{
+			PID:          pid,
+			Comm:         agg.comm,
+			Count:        agg.count,
+			MaxLatencyMS: float64(agg.max) / 1_000_000,
+			AvgLatencyMS: float64(agg.total) / float64(agg.count) / 1_000_000,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].MaxLatencyMS > out[j].MaxLatencyMS })
+	if topN > 0 && len(out) > topN {
+		return out[:topN]
+	}
+	return out
+}
+
 func ASCIIHeatmap(m map[string]uint64) string {
 	buckets := []string{"<1us", "1-5us", "5-10us", "10-50us", "50-100us", "100-500us", "0.5-1ms", "1-5ms", "5-10ms", ">=10ms"}
 	var sb strings.Builder
@@ -383,6 +435,11 @@ func syscallName(id uint32) string {
 	default:
 		return fmt.Sprintf("sys_%d", id)
 	}
+}
+
+func commString(raw [16]byte) string {
+	s := string(raw[:])
+	return strings.TrimRight(s, "\x00")
 }
 
 func cloneMap(in map[string]uint64) map[string]uint64 {

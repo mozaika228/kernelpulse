@@ -212,6 +212,12 @@ func printSnapshot(s collector.Snapshot, counters *counterTracker) {
 	for _, row := range s.TopSyscalls {
 		fmt.Printf("  %-8s count=%d max=%.3fms avg=%.3fms\n", row.Syscall, row.Count, row.MaxLatencyMS, row.AvgLatencyMS)
 	}
+	if len(s.TopProcesses) > 0 {
+		fmt.Println("top slow processes:")
+		for _, row := range s.TopProcesses {
+			fmt.Printf("  pid=%d comm=%s count=%d max=%.3fms avg=%.3fms\n", row.PID, row.Comm, row.Count, row.MaxLatencyMS, row.AvgLatencyMS)
+		}
+	}
 }
 
 func updateMetrics(s collector.Snapshot) {

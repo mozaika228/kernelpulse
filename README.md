@@ -39,6 +39,7 @@ Production-oriented eBPF kernel observability toolkit for Linux.
   - `-c` COMM filter
 - Reporting and exports:
   - top-N slow syscalls (`-t`)
+  - top-N slow processes (PID/COMM)
   - JSON snapshots (`-o output.json`)
   - ASCII heatmap in console
   - Prometheus metrics endpoint
